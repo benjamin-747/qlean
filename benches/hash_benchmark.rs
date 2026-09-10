@@ -1,12 +1,12 @@
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 
 /// Shell-based SHA-256 (legacy method)
-async fn shell_based_sha256(path: &PathBuf) -> String {
+async fn shell_based_sha256(path: &Path) -> String {
     let output = tokio::process::Command::new("sha256sum")
         .arg(path)
         .output()
@@ -21,8 +21,8 @@ async fn shell_based_sha256(path: &PathBuf) -> String {
 }
 
 /// Streaming SHA-256 (new method) - using sync I/O in blocking task
-async fn streaming_sha256(path: &PathBuf) -> String {
-    let path = path.clone();
+async fn streaming_sha256(path: &Path) -> String {
+    let path = path.to_path_buf();
 
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
