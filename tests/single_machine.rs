@@ -197,9 +197,9 @@ async fn test_file_operation() -> Result<()> {
             assert_eq!(target, file_path);
 
             // read_dir
-            let mut entries = vm.read_dir(&base_dir).await?;
+            let entries = vm.read_dir(&base_dir).await?;
             let mut names = Vec::new();
-            while let Some(entry) = entries.next() {
+            for entry in entries {
                 names.push(entry.file_name());
             }
             assert!(names.contains(&"hello.txt".to_string()));

@@ -133,7 +133,17 @@ fn image_cache_name(
     distro: Distro,
     arch: GuestArch,
     override_source: &Option<ImageSource>,
+    override_digest: Option<&(ShaType, String)>,
 ) -> Result<String> {
+    // Prefer digest so catalog images that share a filename (e.g. debian-13-buck2.qcow2
+    // behind rotating presigned URLs) never collide across toolchain versions.
+    if let Some((sha_type, hex)) = override_digest {
+        let prefix = match sha_type {
+            ShaType::Sha256 => "sha256",
+            ShaType::Sha512 => "sha512",
+        };
+        return Ok(format!("{prefix}-{hex}"));
+    }
     if let Some(src) = override_source {
         return Ok(cache_name_from_source(src));
     }
@@ -339,7 +349,10 @@ fn resolve_image_source(source: &str) -> ImageSource {
 fn cache_name_from_source(source: &ImageSource) -> String {
     match source {
         ImageSource::Url(url) => {
-            let last = url.rsplit('/').next().unwrap_or("custom-image.qcow2");
+            // Strip query/fragment so presigned URLs share a stable path stem when
+            // no digest is supplied. Prefer digest-keyed names when available.
+            let path = url.split_once(['?', '#']).map(|(p, _)| p).unwrap_or(url);
+            let last = path.rsplit('/').next().unwrap_or("custom-image.qcow2");
             stem_from_filename(last)
         }
         ImageSource::LocalPath(path) => {
@@ -475,6 +488,12 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
     }
 
     let _ = tokio::fs::remove_file(&tmp_path).await;
+    let len_sidecar = PathBuf::from(format!("{}.len", tmp_path.display()));
+    let _ = tokio::fs::remove_file(&len_sidecar).await;
+    if let Some(total) = total_size {
+        // Sidecar so external watchers (orion-scheduler SSE) can show percent.
+        let _ = tokio::fs::write(&len_sidecar, total.to_string()).await;
+    }
 
     let mut file = File::create(&tmp_path)
         .await
@@ -483,6 +502,8 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
     let mut stream = response.bytes_stream();
     let idle = std::time::Duration::from_secs(60);
     let mut downloaded: u64 = 0;
+    let mut last_logged: u64 = 0;
+    const LOG_EVERY_BYTES: u64 = 32 * 1024 * 1024;
 
     let download_span = info_span!("http_download", url = %url);
 
@@ -503,9 +524,11 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
     if let Some(total) = total_size {
         download_span.pb_set_style(&style_known);
         download_span.pb_set_length(total);
+        info!("Downloading image: 0 / {} MiB", total / (1024 * 1024));
     } else {
         download_span.pb_set_style(&style_unknown);
         download_span.pb_set_length(u64::MAX);
+        info!("Downloading image (size unknown)");
     }
     download_span.pb_set_message("downloading");
 
@@ -524,6 +547,21 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
         file.write_all(&chunk)
             .await
             .with_context(|| "failed to write chunk")?;
+
+        if downloaded.saturating_sub(last_logged) >= LOG_EVERY_BYTES {
+            last_logged = downloaded;
+            if let Some(total) = total_size {
+                let pct = (100.0 * downloaded as f64 / total as f64).min(100.0);
+                info!(
+                    "Downloading image: {} / {} MiB ({:.0}%)",
+                    downloaded / (1024 * 1024),
+                    total / (1024 * 1024),
+                    pct
+                );
+            } else {
+                info!("Downloading image: {} MiB …", downloaded / (1024 * 1024));
+            }
+        }
     }
 
     let hash = hasher.finalize_hex();
@@ -542,6 +580,7 @@ async fn download_with_hash(url: &str, dest_path: &PathBuf, hash_type: ShaType) 
                 dest_path.display()
             )
         })?;
+    let _ = tokio::fs::remove_file(&len_sidecar).await;
 
     info!("Download completed");
     Ok(hash)
@@ -614,9 +653,26 @@ impl Image {
             .map(parse_prefixed_digest)
             .transpose()?;
 
-        let name = image_cache_name(config.distro, config.arch, &override_source)?;
+        let name = image_cache_name(
+            config.distro,
+            config.arch,
+            &override_source,
+            override_digest.as_ref(),
+        )?;
 
         if let Ok(image) = Self::load(&name).await {
+            if let Some((expected_type, expected_hex)) = &override_digest {
+                anyhow::ensure!(
+                    &image.digest.0 == expected_type
+                        && image.digest.1.eq_ignore_ascii_case(expected_hex),
+                    "cached image digest mismatch for {}: expected {:?}:{}, got {:?}:{}",
+                    name,
+                    expected_type,
+                    expected_hex,
+                    image.digest.0,
+                    image.digest.1
+                );
+            }
             return Ok(image);
         }
 
@@ -775,6 +831,25 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             result,
             Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
         );
+    }
+
+    #[test]
+    fn test_image_cache_name_prefers_digest() {
+        let digest = (ShaType::Sha256, "abc123".to_string());
+        let src = Some(ImageSource::Url(
+            "https://example.com/orion-images/abc123/debian-13-buck2.qcow2?X-Amz-Signature=deadbeef"
+                .to_string(),
+        ));
+        let name = image_cache_name(Distro::Debian, GuestArch::Amd64, &src, Some(&digest)).unwrap();
+        assert_eq!(name, "sha256-abc123");
+    }
+
+    #[test]
+    fn test_cache_name_from_url_strips_query() {
+        let src = ImageSource::Url(
+            "https://example.com/path/debian-13-buck2.qcow2?X-Amz-Signature=deadbeef".to_string(),
+        );
+        assert_eq!(cache_name_from_source(&src), "debian-13-buck2");
     }
 
     #[test]
