@@ -1,6 +1,6 @@
 [package]
 name = "qlean"
-version = "0.3.1"
+version = "0.3.2"
 authors = ["jl.jiang <jiangjl9807@gmail.com>"]
 categories = ["development-tools::testing", "virtualization"]
 description = "A system-level isolation testing library based on QEMU/KVM."
@@ -22,7 +22,7 @@ indicatif = "0.18.6"
 kvm-ioctls = "0.25.0"
 nanoid = "0.5.0"
 qapi = { version = "0.15.0", features = ["qmp", "async-tokio-all"] }
-rand = "0.10.2"
+rand = "0.10.3"
 reqwest = { version = "0.13.5", features = ["stream"] }
 russh = "0.63.3"
 russh-sftp = "3.0.0"
